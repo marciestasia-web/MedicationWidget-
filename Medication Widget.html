@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Medication Administration Record</title>
+<style>
+  :root{
+    --ink:#1f2d3a; --muted:#5b6b78; --line:#c9d3dc; --head:#eef3f6; --side:#f7f9fb;
+    --accent:#1b5e7a; --ok:#2e7d4f; --okbg:#e8f5ec; --err:#b42318; --errbg:#fdecea;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:transparent;color:var(--ink);
+    font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .mar{padding:2px 2px 6px}
+  .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:6px;background:#fff}
+  table{border-collapse:separate;border-spacing:0;min-width:100%}
+  th,td{border-right:1px solid var(--line);border-bottom:1px solid var(--line);padding:6px;vertical-align:top;background:#fff;text-align:left}
+  tr > *:last-child{border-right:0}
+  tfoot tr > *{border-bottom:0}
+  thead th{background:var(--head);font-weight:600}
+  .rowh{position:sticky;left:0;z-index:2;min-width:170px;width:170px;background:var(--side);box-shadow:1px 0 0 var(--line)}
+  thead .rowh{z-index:3;background:var(--head);vertical-align:bottom}
+  tfoot th, tfoot td{background:var(--side)}
+  .col{min-width:132px;width:132px}
+
+  input{font:inherit;color:inherit;width:100%;border:1px solid var(--line);border-radius:4px;padding:7px 8px;background:#fff;min-height:38px;-webkit-appearance:none;appearance:none}
+  input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+  .dt input{padding:5px 6px;font-size:14px;min-height:34px}
+  .dt input + input{margin-top:4px}
+  .colbar{display:flex;justify-content:space-between;align-items:center;gap:4px;margin-bottom:4px}
+  .medcell{display:flex;gap:4px;align-items:center}
+  .initials input{text-transform:uppercase;text-align:center;font-weight:600;letter-spacing:.04em}
+
+  button{font:inherit;cursor:pointer;border-radius:4px}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .mini{border:1px solid var(--line);background:#fff;color:var(--accent);font-size:13px;padding:3px 8px;min-height:28px}
+  .x{border:0;background:transparent;color:var(--muted);font-size:18px;line-height:1;padding:2px 6px;min-height:28px;flex:none}
+  .x.arm{color:#fff;background:var(--err);font-size:12px;padding:5px 6px}
+
+  .msg{display:none;font-size:12px;color:var(--err);margin-top:4px;font-weight:600}
+  .need{background:var(--errbg) !important}
+  td.need input, input.missing{border-color:var(--err)}
+  .need .msg{display:block}
+  .signed{background:var(--okbg) !important}
+  thead th.signed{box-shadow:inset 0 3px 0 var(--ok)}
+
+  .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .btn{border:1px solid var(--accent);background:#fff;color:var(--accent);padding:8px 14px;min-height:40px;font-weight:600}
+  .status{margin-top:8px;font-size:14px;color:var(--muted);min-height:1.4em}
+  .status.bad{color:var(--err);font-weight:600}
+  .tzlabel{display:block;font-weight:400;font-size:12px;color:var(--muted);margin-top:2px}
+  .local{font-size:12px;color:var(--muted);margin-top:3px;min-height:1em}
+  .btn.quiet{border-color:var(--line);color:var(--muted)}
+  #preview{display:none;margin-top:10px;max-width:100%;border:1px solid var(--line);border-radius:4px;background:#fff}
+  #preview.show{display:block}
+</style>
+</head>
+<body>
+<div class="mar" id="mar">
+  <div class="scroll"><table id="grid" aria-label="Medication administration record"></table></div>
+  <div class="actions">
+    <button type="button" class="btn" id="addMed">Add medication</button>
+    <button type="button" class="btn" id="addTime">Add time</button>
+    <button type="button" class="btn quiet" id="togglePreview" aria-expanded="false">Preview PDF layout</button>
+  </div>
+  <div class="status" id="status" role="status" aria-live="polite"></div>
+  <img id="preview" alt="Preview of the medication record as it will appear in the PDF">
+</div>
+
+<script>
+(function () {
+  var grid = document.getElementById('grid');
+  var statusEl = document.getElementById('status');
+  var root = document.getElementById('mar');
+  var uid = 0, booted = false, lastH = 0, sendTimer = null;
+  var state = { cols: [], meds: [] };
+
+  function nid() { return 'k' + (++uid); }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  // "Now" records UTC by default, whatever time zone the device is set to.
+  var useUTC = true;
+  function stampNow(c) {
+    var d = new Date();
+    if (useUTC) {
+      c.date = d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+      c.time = pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes());
+    } else {
+      c.date = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+      c.time = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+  }
+  // Device-local equivalent of a UTC entry, shown as a hint under the time.
+  function localHint(c) {
+    if (!useUTC) return '';
+    var dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(c.date || ''), tm = /^(\d{2}):(\d{2})/.exec(c.time || '');
+    if (!dm || !tm) return '';
+    var d = new Date(Date.UTC(+dm[1], +dm[2] - 1, +dm[3], +tm[1], +tm[2]));
+    var t = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    var sameDay = d.getFullYear() === +dm[1] && d.getMonth() === +dm[2] - 1 && d.getDate() === +dm[3];
+    return 'Device time ' + t + (sameDay ? '' : ' (' + d.getDate() + ' ' + MONTHS[d.getMonth()] + ')');
+  }
+  function blankCol(fill) { var c = { id: nid(), date: '', time: '', initials: '' }; if (fill) stampNow(c); return c; }
+  function blankMed() { return { id: nid(), name: '', doses: {} }; }
+  function filled(v) { return (v || '').trim() !== ''; }
+
+  function el(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    if (attrs) for (var k in attrs) {
+      if (k === 'class') e.className = attrs[k];
+      else if (k === 'value') e.value = attrs[k];
+      else e.setAttribute(k, attrs[k]);
+    }
+    (kids || []).forEach(function (c) {
+      if (c != null) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    });
+    return e;
+  }
+  function onEdit(input, fn) {
+    input.addEventListener('input', fn);
+    input.addEventListener('change', fn); // iOS date/time pickers fire change
+    return input;
+  }
+  // Two-tap remove: first tap arms, second tap within 3 s removes.
+  function removeBtn(fn, label) {
+    var b = el('button', { type: 'button', 'class': 'x', 'aria-label': label, title: label }, ['×']);
+    var t;
+    b.addEventListener('click', function () {
+      if (b.classList.contains('arm')) { clearTimeout(t); fn(); return; }
+      b.classList.add('arm'); b.textContent = 'Remove?';
+      t = setTimeout(function () { b.classList.remove('arm'); b.textContent = '×'; }, 3000);
+    });
+    return b;
+  }
+
+  function render() {
+    grid.textContent = '';
+    var oneCol = state.cols.length === 1, oneMed = state.meds.length === 1;
+
+    // Header: date and time per column
+    var hr = el('tr', null, [el('th', { 'class': 'rowh', scope: 'col' }, ['Medication',
+      useUTC ? el('span', { 'class': 'tzlabel' }, ['Dates and times in UTC']) : null])]);
+    state.cols.forEach(function (c, i) {
+      var n = i + 1;
+      var bar = el('div', { 'class': 'colbar' }, [
+        el('button', { type: 'button', 'class': 'mini', 'aria-label': 'Set time ' + n + ' to now' }, ['Now'])
+      ]);
+      bar.firstChild.addEventListener('click', function () { stampNow(c); render(); changed(); });
+      if (!oneCol) bar.appendChild(removeBtn(function () {
+        state.cols.splice(state.cols.indexOf(c), 1);
+        state.meds.forEach(function (m) { delete m.doses[c.id]; });
+        render(); changed();
+      }, 'Remove time ' + n));
+      hr.appendChild(el('th', { 'class': 'col dt', 'data-col': c.id, scope: 'col' }, [
+        bar,
+        onEdit(el('input', { type: 'date', value: c.date, 'class': 'cdate', 'aria-label': 'Date, time ' + n }),
+          function (e) { c.date = e.target.value; changed(); }),
+        onEdit(el('input', { type: 'time', value: c.time, 'class': 'ctime', 'aria-label': 'Time ' + n }),
+          function (e) { c.time = e.target.value; changed(); }),
+        el('div', { 'class': 'local' }),
+        el('div', { 'class': 'msg' }, ['Date and time required'])
+      ]));
+    });
+    grid.appendChild(el('thead', null, [hr]));
+
+    // Body: one row per medication, dose under each time
+    var tb = el('tbody');
+    state.meds.forEach(function (m, r) {
+      var nameIn = onEdit(el('input', { type: 'text', value: m.name, placeholder: 'Medication name',
+        autocomplete: 'off', 'aria-label': 'Medication ' + (r + 1) + ' name', 'class': 'medname' }),
+        function (e) { m.name = e.target.value; changed(); });
+      var cell = el('div', { 'class': 'medcell' }, [nameIn]);
+      if (!oneMed) cell.appendChild(removeBtn(function () {
+        state.meds.splice(state.meds.indexOf(m), 1); render(); changed();
+      }, 'Remove medication ' + (r + 1)));
+      var tr = el('tr', null, [el('th', { 'class': 'rowh', scope: 'row', 'data-med': m.id }, [
+        cell, el('div', { 'class': 'msg' }, ['Medication name required'])
+      ])]);
+      state.cols.forEach(function (c, i) {
+        tr.appendChild(el('td', { 'class': 'col', 'data-col': c.id }, [
+          onEdit(el('input', { type: 'text', value: m.doses[c.id] || '', placeholder: 'Dose', autocomplete: 'off',
+            'aria-label': 'Dose of medication ' + (r + 1) + ' at time ' + (i + 1) }),
+            function (e) { m.doses[c.id] = e.target.value; changed(); })
+        ]));
+      });
+      tb.appendChild(tr);
+    });
+    grid.appendChild(tb);
+
+    // Footer: initials per column
+    var fr = el('tr', null, [el('th', { 'class': 'rowh', scope: 'row' }, ['Initials'])]);
+    state.cols.forEach(function (c, i) {
+      fr.appendChild(el('td', { 'class': 'col initials', 'data-col': c.id }, [
+        onEdit(el('input', { type: 'text', value: c.initials, maxlength: '4', autocomplete: 'off',
+          autocapitalize: 'characters', spellcheck: 'false', 'aria-label': 'Initials, time ' + (i + 1) }),
+          function (e) { c.initials = e.target.value.toUpperCase(); changed(); }),
+        el('div', { 'class': 'msg' }, ['Initials required'])
+      ]));
+    });
+    grid.appendChild(el('tfoot', null, [fr]));
+
+    validate();
+    resize();
+  }
+
+  // A column with any dose must have a date, a time and initials.
+  function validate() {
+    var noInit = 0, noDT = 0;
+    state.cols.forEach(function (c) {
+      var has = state.meds.some(function (m) { return filled(m.doses[c.id]); });
+      var dateMiss = has && !filled(c.date), timeMiss = has && !filled(c.time);
+      var initMiss = has && !filled(c.initials);
+      if (initMiss) noInit++;
+      if (dateMiss || timeMiss) noDT++;
+      var signed = has && !initMiss && !dateMiss && !timeMiss;
+
+      var cells = grid.querySelectorAll('[data-col="' + c.id + '"]');
+      for (var i = 0; i < cells.length; i++) {
+        cells[i].classList.toggle('signed', signed);
+        if (cells[i].classList.contains('initials')) cells[i].classList.toggle('need', initMiss);
+      }
+      var th = grid.querySelector('thead th[data-col="' + c.id + '"]');
+      if (th) {
+        th.classList.toggle('need', dateMiss || timeMiss);
+        th.querySelector('.cdate').classList.toggle('missing', dateMiss);
+        th.querySelector('.ctime').classList.toggle('missing', timeMiss);
+        th.querySelector('.local').textContent = localHint(c);
+        th.querySelector('.msg').textContent =
+          dateMiss && timeMiss ? 'Date and time required' : dateMiss ? 'Date required' : 'Time required';
+      }
+    });
+    // A medication row with any dose must have a name.
+    var noName = 0;
+    state.meds.forEach(function (m) {
+      var has = state.cols.some(function (c) { return filled(m.doses[c.id]); });
+      var miss = has && !filled(m.name);
+      if (miss) noName++;
+      var th = grid.querySelector('tbody th[data-med="' + m.id + '"]');
+      if (th) { th.classList.toggle('need', miss); th.querySelector('.medname').classList.toggle('missing', miss); }
+    });
+
+    var parts = [];
+    if (noName) parts.push(noName === 1 ? '1 dose row has no medication name.' : noName + ' dose rows have no medication name.');
+    if (noDT) parts.push(noDT === 1 ? '1 time with doses is missing its date or time.' : noDT + ' times with doses are missing a date or time.');
+    if (noInit) parts.push(noInit === 1 ? '1 time with doses has no initials.' : noInit + ' times with doses have no initials.');
+    statusEl.textContent = parts.join(' ');
+    statusEl.className = 'status' + (parts.length ? ' bad' : '');
+    return parts.length === 0;
+  }
+
+  // Plain-text value: readable in submissions and the PDF, and parsed back when a submission is edited.
+  function serialize() {
+    var lines = [];
+    var named = state.meds.filter(function (m) { return filled(m.name); })
+      .map(function (m) { return m.name.trim(); });
+    if (named.length) lines.push('Medications: ' + named.join(' ; '));
+    state.cols.forEach(function (c) {
+      var given = state.meds.filter(function (m) { return filled(m.doses[c.id]); });
+      if (!given.length && !filled(c.initials)) return;
+      lines.push((c.date || '(no-date)') + ' ' + (c.time ? c.time + (useUTC ? 'Z' : '') : '(no-time)') + ' | Initials: ' + (filled(c.initials) ? c.initials.trim() : '—'));
+      given.forEach(function (m) {
+        lines.push('  - ' + (filled(m.name) ? m.name.trim() : '(unnamed)') + ': ' + m.doses[c.id].trim());
+      });
+    });
+    return lines.length ? lines.join('\n') : '';
+  }
+
+  // ---------- Settings ----------
+  // output: "text" (default) or "image" (PDF-ready grid in blocks). perBlock: times per block (default 6).
+  var mode = 'text', perBlock = 6;
+  function readSettings() {
+    var o, p;
+    try { var q = new URLSearchParams(location.search); o = q.get('output'); p = q.get('perBlock'); } catch (e) {}
+    try {
+      if (window.JFCustomWidget && JFCustomWidget.getWidgetSetting) {
+        o = JFCustomWidget.getWidgetSetting('output') || o;
+        p = JFCustomWidget.getWidgetSetting('perBlock') || p;
+      }
+    } catch (e) {}
+    mode = String(o || 'text').toLowerCase() === 'image' ? 'image' : 'text';
+    var tz;
+    try { tz = new URLSearchParams(location.search).get('timezone'); } catch (e) {}
+    try { if (window.JFCustomWidget && JFCustomWidget.getWidgetSetting) tz = JFCustomWidget.getWidgetSetting('timezone') || tz; } catch (e) {}
+    useUTC = String(tz || 'utc').toLowerCase() !== 'local';
+    var n = parseInt(p, 10);
+    if (n >= 2 && n <= 12) perBlock = n;
+  }
+
+  // ---------- PDF layout: grid in blocks of `perBlock` times, stacked down a portrait page ----------
+  var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function fmtDate(d) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(d || '');
+    return m ? (+m[3]) + ' ' + MONTHS[+m[2] - 1] + ' ' + m[1] : (d || '');
+  }
+  function fit(ctx, text, w) {
+    text = text || '';
+    if (ctx.measureText(text).width <= w) return text;
+    while (text.length && ctx.measureText(text + '…').width > w) text = text.slice(0, -1);
+    return text + '…';
+  }
+  function drawBlocks() {
+    var cols = state.cols.filter(function (c) {
+      return filled(c.initials) || state.meds.some(function (m) { return filled(m.doses[c.id]); });
+    });
+    var meds = state.meds.filter(function (m) {
+      return filled(m.name) || cols.some(function (c) { return filled(m.doses[c.id]); });
+    });
+    if (!cols.length && !meds.length) return '';
+    if (!meds.length) meds = [blankMed()];
+
+    var W = 760, MED = 170, CW = (W - MED) / perBlock, HEAD = 42, ROW = 30, GAP = 22, TITLE = 30, LABEL = 22, S = 2;
+    var F = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif';
+    var nBlocks = Math.max(1, Math.ceil(cols.length / perBlock));
+    var gridH = HEAD + ROW * meds.length + ROW;
+    var blockH = LABEL + gridH;
+    var H = TITLE + nBlocks * blockH + (nBlocks - 1) * GAP + 2;
+
+    var cv = document.createElement('canvas');
+    cv.width = W * S; cv.height = Math.ceil(H * S);
+    var x = cv.getContext('2d');
+    x.scale(S, S);
+    x.fillStyle = '#fff'; x.fillRect(0, 0, W, H);
+    x.textBaseline = 'middle';
+    x.fillStyle = '#000'; x.font = '600 16px ' + F;
+    x.fillText('Medication Administration Record' + (useUTC ? ' (times UTC)' : ''), 0, TITLE / 2 - 2);
+
+    for (var b = 0; b < nBlocks; b++) {
+      var y0 = TITLE + b * (blockH + GAP), top = y0 + LABEL;
+      var slice = cols.slice(b * perBlock, (b + 1) * perBlock);
+      var first = b * perBlock + 1, last = first + Math.max(slice.length, 1) - 1;
+
+      x.font = '12px ' + F; x.fillStyle = '#444';
+      x.fillText(first === last ? 'Time ' + first : 'Times ' + first + '–' + last, 0, y0 + LABEL / 2);
+
+      x.fillStyle = '#e9eef2'; x.fillRect(0, top, W, HEAD);
+      x.fillStyle = '#f4f6f8'; x.fillRect(0, top + HEAD + ROW * meds.length, W, ROW);
+      x.fillStyle = '#000';
+
+      x.font = '600 13px ' + F; x.fillText('Medication', 6, top + HEAD / 2);
+      slice.forEach(function (c, i) {
+        var cx = MED + i * CW + 5;
+        x.font = '12px ' + F; x.fillText(fit(x, fmtDate(c.date) || 'No date', CW - 10), cx, top + 13);
+        x.font = '600 13px ' + F; x.fillText(fit(x, c.time ? c.time + (useUTC ? 'Z' : '') : 'No time', CW - 10), cx, top + 30);
+      });
+
+      meds.forEach(function (m, r) {
+        var ry = top + HEAD + r * ROW + ROW / 2;
+        x.font = '13px ' + F;
+        x.fillText(fit(x, m.name || '', MED - 12), 6, ry);
+        slice.forEach(function (c, i) {
+          var v = (m.doses[c.id] || '').trim();
+          if (v) x.fillText(fit(x, v, CW - 10), MED + i * CW + 5, ry);
+        });
+      });
+
+      var iy = top + HEAD + meds.length * ROW + ROW / 2;
+      x.font = '600 13px ' + F; x.fillText('Initials', 6, iy);
+      x.textAlign = 'center';
+      slice.forEach(function (c, i) { if (filled(c.initials)) x.fillText(c.initials.trim(), MED + i * CW + CW / 2, iy); });
+      x.textAlign = 'left';
+
+      x.strokeStyle = '#7a8792'; x.lineWidth = 1;
+      x.strokeRect(0.5, top + 0.5, W - 1, gridH);
+      x.beginPath();
+      for (var k = 0; k < perBlock; k++) {
+        var lx = Math.round(MED + k * CW) + 0.5;
+        x.moveTo(lx, top); x.lineTo(lx, top + gridH);
+      }
+      for (var r = 0; r <= meds.length; r++) {
+        var ly = Math.round(top + HEAD + r * ROW) + 0.5;
+        x.moveTo(0, ly); x.lineTo(W, ly);
+      }
+      x.stroke();
+    }
+    return cv.toDataURL('image/png');
+  }
+
+  function outputValue() { return mode === 'image' ? drawBlocks() : serialize(); }
+
+  // ---------- Preview ----------
+  var previewEl = document.getElementById('preview');
+  var previewBtn = document.getElementById('togglePreview');
+  function refreshPreview() {
+    if (!previewEl.classList.contains('show')) return;
+    var url = drawBlocks();
+    if (url) previewEl.src = url; else previewEl.removeAttribute('src');
+    previewEl.alt = url ? 'Preview of the medication record as it will appear in the PDF' : 'Nothing entered yet';
+  }
+  previewEl.addEventListener('load', function () { resize(); });
+  previewBtn.addEventListener('click', function () {
+    var show = !previewEl.classList.contains('show');
+    previewEl.classList.toggle('show', show);
+    previewBtn.textContent = show ? 'Hide preview' : 'Preview PDF layout';
+    previewBtn.setAttribute('aria-expanded', show ? 'true' : 'false');
+    refreshPreview(); resize();
+  });
+
+  function parse(text) {
+    if (!text || typeof text !== 'string') return false;
+    var cols = [], meds = [], byName = {}, cur = null;
+    function med(name) {
+      var k = name.toLowerCase();
+      if (!byName[k]) { byName[k] = { id: nid(), name: name, doses: {} }; meds.push(byName[k]); }
+      return byName[k];
+    }
+    text.split(/\r?\n/).forEach(function (l) {
+      var m;
+      if ((m = l.match(/^Medications: (.*)$/))) {
+        m[1].split(' ; ').forEach(function (n) { n = n.trim(); if (n) med(n); });
+      } else if ((m = l.match(/^(\S+) (\S+) \| Initials: (.*)$/))) {
+        cur = { id: nid(), date: m[1] === '(no-date)' ? '' : m[1], time: m[2] === '(no-time)' ? '' : m[2].replace(/Z$/i, ''),
+          initials: m[3].trim() === '—' ? '' : m[3].trim() };
+        cols.push(cur);
+      } else if (cur && (m = l.match(/^\s+- (.*)$/))) {
+        var s = m[1], k = s.indexOf(': ');
+        if (k < 0) return;
+        var n = s.slice(0, k).trim(), d = s.slice(k + 2).trim();
+        var target = (n && n !== '(unnamed)') ? med(n) : (function () { var x = blankMed(); meds.push(x); return x; })();
+        target.doses[cur.id] = d;
+      }
+    });
+    if (!cols.length && !meds.length) return false;
+    if (!cols.length) cols.push(blankCol());
+    if (!meds.length) meds.push(blankMed());
+    state.cols = cols; state.meds = meds;
+    return true;
+  }
+
+  function changed() {
+    validate();
+    clearTimeout(sendTimer);
+    sendTimer = setTimeout(function () {
+      if (window.JFCustomWidget) { try { JFCustomWidget.sendData({ value: outputValue() }); } catch (e) {} }
+      refreshPreview();
+    }, 300);
+    resize();
+  }
+
+  function resize() {
+    var h = Math.ceil(root.getBoundingClientRect().height) + 8;
+    if (h === lastH || !window.JFCustomWidget) return;
+    lastH = h;
+    try { JFCustomWidget.requestFrameResize({ height: h }); } catch (e) {}
+  }
+
+  document.getElementById('addMed').addEventListener('click', function () {
+    state.meds.push(blankMed()); render(); changed();
+    var names = grid.querySelectorAll('.medname');
+    if (names.length) names[names.length - 1].focus();
+  });
+  document.getElementById('addTime').addEventListener('click', function () {
+    state.cols.push(blankCol(true)); render(); changed();
+    var sc = grid.parentNode; sc.scrollLeft = sc.scrollWidth;
+  });
+
+  // Starting layout
+  readSettings();
+  state.cols = [blankCol(), blankCol(), blankCol(), blankCol()];
+  state.meds = [blankMed(), blankMed(), blankMed()];
+  render();
+  if (window.ResizeObserver) new ResizeObserver(resize).observe(root);
+
+  // Jotform hookup (runs once the widget library has loaded; page also works standalone for testing)
+  window.MAR_BOOT = function () {
+    if (booted || !window.JFCustomWidget) return;
+    booted = true;
+    JFCustomWidget.subscribe('ready', function (data) {
+      readSettings();
+      var v = data && data.value;
+      // Text values reload into the grid; image values can't be read back, so the grid starts fresh.
+      if (v && !/^(data:image|https?:)/i.test(v)) parse(v);
+      render();
+      lastH = 0; resize();
+    });
+    JFCustomWidget.subscribe('submit', function () {
+      var ok = validate();
+      JFCustomWidget.sendSubmit({ valid: ok, value: ok ? outputValue() : serialize() });
+    });
+  };
+
+  // Offline cache
+  if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    try { navigator.serviceWorker.register('sw.js'); } catch (e) {}
+  }
+})();
+</script>
+
+<!-- Load the Jotform widget library: local copy first (works offline), Jotform's CDN as fallback -->
+<script>
+(function () {
+  function boot() { if (window.MAR_BOOT) window.MAR_BOOT(); }
+  var s = document.createElement('script');
+  s.src = 'JotFormCustomWidget.min.js';
+  s.onload = boot;
+  s.onerror = function () {
+    var c = document.createElement('script');
+    c.src = 'https://js.jotform.com/JotFormCustomWidget.min.js';
+    c.onload = boot; c.onerror = boot;
+    document.head.appendChild(c);
+  };
+  document.head.appendChild(s);
+})();
+</script>
+</body>
+</html>
