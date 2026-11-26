@@ -1,5 +1,5 @@
 // Bump the version whenever you change index.html so devices pick up the new copy.
-var CACHE = 'mar-widget-v14';
+var CACHE = 'mar-widget-v21';
 var FILES = ['./', './index.html', './JotFormCustomWidget.min.js'];
 
 self.addEventListener('install', function (e) {
