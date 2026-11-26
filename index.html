@@ -52,4 +52,853 @@
   .tzlabel{display:block;font-weight:400;font-size:12px;color:var(--muted);margin-top:2px}
   .local{font-size:12px;color:var(--muted);margin-top:3px;min-height:1em;white-space:pre-line}
   .local .rcv{display:block;color:var(--accent);font-weight:600}
-  select.tzsel{display:block;font:inherit;font-size:13px;font-weight:600;width:100%;margin-top:4px;padding:5px
+  select.tzsel{display:block;font:inherit;font-size:13px;font-weight:600;width:100%;margin-top:4px;padding:5px 6px;border:1px solid var(--line);border-radius:4px;background:#fff;color:var(--ink);min-height:32px}
+  select.tzsel:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  select.tzsel.missing{border-color:var(--err);background:var(--errbg)}
+  .selmsg{display:none;font-size:12px;color:var(--err);font-weight:600;margin-top:3px}
+  select.tzsel.missing + .selmsg{display:block}
+  .clock{display:block;font-weight:600;font-size:12px;color:var(--accent);margin-top:4px;line-height:1.35}
+  .clock span{display:block;font-weight:400;color:var(--muted)}
+  .medsub{display:flex;gap:6px;align-items:center;margin-top:4px}
+  .medsub .freq{font-size:13px;padding:5px 6px;min-height:32px}
+  .prn{display:flex;align-items:center;gap:4px;font-size:13px;font-weight:600;color:var(--ink);white-space:nowrap;cursor:pointer}
+  .prn input{width:20px;height:20px;min-height:0;margin:0;padding:0;-webkit-appearance:checkbox;appearance:auto;accent-color:var(--accent)}
+  select.tzsel.route{font-size:13px;margin-top:4px;min-height:32px}
+  .doserow{display:flex;gap:4px}
+  .doserow input{flex:1 1 42%;min-width:0}
+  .doserow select.tzsel.unit{flex:1 1 58%;min-width:0;margin-top:0;min-height:38px;font-size:13px;padding:5px 4px}
+  .dosemsg{display:none;font-size:12px;color:var(--err);font-weight:600;margin-top:3px}
+  .dosemsg.show{display:block}
+  .btn.quiet{border-color:var(--line);color:var(--muted)}
+  #preview{display:none;margin-top:10px;max-width:100%;border:1px solid var(--line);border-radius:4px;background:#fff}
+  #preview.show{display:block}
+</style>
+</head>
+<body>
+<div class="mar" id="mar">
+  <div class="scroll"><table id="grid" aria-label="Medication administration record"></table></div>
+  <div class="actions">
+    <button type="button" class="btn" id="addMed">Add medication</button>
+    <button type="button" class="btn" id="addTime">Add time</button>
+    <button type="button" class="btn quiet" id="sortTimes">Sort by time</button>
+    <button type="button" class="btn quiet" id="togglePreview" aria-expanded="true">Hide preview</button>
+  </div>
+  <div class="status" id="status" role="status" aria-live="polite"></div>
+  <img id="preview" class="show" alt="Preview of the medication record as it will appear in the PDF">
+</div>
+
+<script>
+(function () {
+  var grid = document.getElementById('grid');
+  var statusEl = document.getElementById('status');
+  var root = document.getElementById('mar');
+  var uid = 0, booted = false, lastH = 0, sendTimer = null;
+  var state = { cols: [], meds: [] };
+
+  function nid() { return 'k' + (++uid); }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  // "Now" records UTC by default, whatever time zone the device is set to.
+  var useUTC = true;
+  var zoneTouched = false; // true once a saved record sets the zone
+  var zoneSet = false;     // record zone explicitly chosen (or preset by widget setting / saved record)
+  // Receiving facility's time zone (minutes from UTC), or null when not set. Only changes how times are shown.
+  var rcvMins = null, rcvTouched = false;
+  function receivingTime(c) {
+    if (rcvMins === null) return null;
+    var dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(c.date || ''), tm = /^(\d{2}):(\d{2})/.exec(c.time || '');
+    if (!dm || !tm) return null;
+    var d = new Date(Date.UTC(+dm[1], +dm[2] - 1, +dm[3], +tm[1], +tm[2]) - zoneMins * 60000 + rcvMins * 60000);
+    return {
+      date: d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()),
+      time: pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()),
+      sameDay: d.getUTCFullYear() === +dm[1] && d.getUTCMonth() === +dm[2] - 1 && d.getUTCDate() === +dm[3],
+      dayLabel: d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()]
+    };
+  }
+  function parseZone(v) {
+    var m = /^\s*(?:UTC)?\s*([+\-−])?\s*(\d{1,2})(?::?(\d{2}))?\s*$/i.exec(String(v || ''));
+    if (!m) return 0;
+    var mins = (+m[2]) * 60 + (+(m[3] || 0));
+    if (m[1] === '-' || m[1] === '−') mins = -mins;
+    return (mins >= -720 && mins <= 840) ? mins : 0;
+  }
+  // Fixed time zone for the record, in minutes from UTC (0 = UTC). Crews can change it from the header.
+  var zoneMins = 0;
+  function zoneName() { return offsetLabel(zoneMins); }
+  function stampNow(c) {
+    var d = new Date();
+    if (useUTC) {
+      d = new Date(d.getTime() + zoneMins * 60000);
+      c.date = d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+      c.time = pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes());
+    } else {
+      c.date = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+      c.time = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+  }
+  // Device-local equivalent of a UTC entry, shown as a hint under the time.
+  function localHint(c) {
+    if (!useUTC) return '';
+    var dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(c.date || ''), tm = /^(\d{2}):(\d{2})/.exec(c.time || '');
+    if (!dm || !tm) return '';
+    var d = new Date(Date.UTC(+dm[1], +dm[2] - 1, +dm[3], +tm[1], +tm[2]) - zoneMins * 60000);
+    var t = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    var sameDay = d.getFullYear() === +dm[1] && d.getMonth() === +dm[2] - 1 && d.getDate() === +dm[3];
+    return 'Device time ' + t + (sameDay ? '' : ' (' + d.getDate() + ' ' + MONTHS[d.getMonth()] + ')');
+  }
+  // True if a column's date/time is later than now (5-minute allowance for small clock differences).
+  var FUTURE_GRACE = 5 * 60000;
+  function todayInZone() {
+    var d = new Date();
+    if (useUTC) { d = new Date(d.getTime() + zoneMins * 60000);
+      return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()); }
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  }
+  function isFuture(c) {
+    var dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(c.date || '');
+    if (!dm) return false;
+    var tm = /^(\d{2}):(\d{2})/.exec(c.time || '');
+    if (!tm) return c.date > todayInZone();
+    var t = useUTC ? Date.UTC(+dm[1], +dm[2] - 1, +dm[3], +tm[1], +tm[2]) - zoneMins * 60000
+                   : new Date(+dm[1], +dm[2] - 1, +dm[3], +tm[1], +tm[2]).getTime();
+    return t > Date.now() + FUTURE_GRACE;
+  }
+  function blankCol(fill) { var c = { id: nid(), date: '', time: '', initials: '' }; if (fill) stampNow(c); return c; }
+  function blankMed() { return { id: nid(), name: '', freq: '', prn: false, doses: {}, units: {}, routes: {} }; }
+  var UNITS = ['mg', 'mcg', 'g', 'units', 'mEq', 'mmol', 'mL'];
+  function isNumber(v) { return /^\s*(\d+(\.\d*)?|\.\d+)\s*$/.test(v || ''); }
+  var ROUTES = ['IV', 'IO', 'IM', 'SC', 'PO', 'SL', 'PR', 'NG/OG/G-tube'];
+  function filled(v) { return (v || '').trim() !== ''; }
+
+  function el(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    if (attrs) for (var k in attrs) {
+      if (k === 'class') e.className = attrs[k];
+      else if (k === 'value') e.value = attrs[k];
+      else e.setAttribute(k, attrs[k]);
+    }
+    (kids || []).forEach(function (c) {
+      if (c != null) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    });
+    return e;
+  }
+  function sortOnBlur(input) { input.addEventListener('blur', scheduleSort); return input; }
+  function onEdit(input, fn) {
+    input.addEventListener('input', fn);
+    input.addEventListener('change', fn); // iOS date/time pickers fire change
+    return input;
+  }
+  // Two-tap remove: first tap arms, second tap within 3 s removes.
+  function removeBtn(fn, label) {
+    var b = el('button', { type: 'button', 'class': 'x', 'aria-label': label, title: label }, ['×']);
+    var t;
+    b.addEventListener('click', function () {
+      if (b.classList.contains('arm')) { clearTimeout(t); fn(); return; }
+      b.classList.add('arm'); b.textContent = 'Remove?';
+      t = setTimeout(function () { b.classList.remove('arm'); b.textContent = '×'; }, 3000);
+    });
+    return b;
+  }
+
+  // ---------- Chronological order ----------
+  // Columns with both a date and a time sort by clock time; incomplete ones keep their order at the end.
+  function colKey(c) { return (filled(c.date) && filled(c.time)) ? c.date + 'T' + c.time : null; }
+  function orderedCols() {
+    var done = [], rest = [];
+    state.cols.forEach(function (c) { (colKey(c) ? done : rest).push(c); });
+    done.sort(function (a, b) { var ka = colKey(a), kb = colKey(b); return ka < kb ? -1 : ka > kb ? 1 : 0; });
+    return done.concat(rest);
+  }
+  function sortScreen() {
+    var next = orderedCols();
+    var moved = next.some(function (c, i) { return c !== state.cols[i]; });
+    if (moved) state.cols = next;
+    return moved;
+  }
+  var sortTimer = null;
+  function scheduleSort() {
+    clearTimeout(sortTimer);
+    sortTimer = setTimeout(function () { if (sortScreen()) { render(); changed(); } }, 150);
+  }
+
+  function render() {
+    // Keep focus on the same field when the grid is rebuilt (e.g. after columns are re-sorted).
+    var act = document.activeElement, fk = act && act.getAttribute && act.getAttribute('data-fk');
+    grid.textContent = '';
+    var oneCol = state.cols.length === 1, oneMed = state.meds.length === 1;
+
+    // Header: date and time per column
+    var hr = el('tr', null, [el('th', { 'class': 'rowh', scope: 'col' }, ['Medication',
+      useUTC ? el('label', { 'class': 'tzlabel' }, ['Time zone for this record', zoneSelect()]) : null,
+      useUTC ? el('label', { 'class': 'tzlabel' }, ['Receiving facility time zone', rcvSelect()]) : null,
+      useUTC ? el('span', { 'class': 'clock' }) : null])]);
+    state.cols.forEach(function (c, i) {
+      var n = i + 1;
+      var bar = el('div', { 'class': 'colbar' }, [
+        el('button', { type: 'button', 'class': 'mini', 'aria-label': 'Set time ' + n + ' to now' }, ['Now'])
+      ]);
+      bar.firstChild.addEventListener('click', function () { stampNow(c); sortScreen(); render(); changed(); });
+      if (!oneCol) bar.appendChild(removeBtn(function () {
+        state.cols.splice(state.cols.indexOf(c), 1);
+        state.meds.forEach(function (m) { delete m.doses[c.id]; if (m.routes) delete m.routes[c.id]; if (m.units) delete m.units[c.id]; });
+        render(); changed();
+      }, 'Remove time ' + n));
+      hr.appendChild(el('th', { 'class': 'col dt', 'data-col': c.id, scope: 'col' }, [
+        bar,
+        sortOnBlur(onEdit(el('input', { type: 'date', value: c.date, max: todayInZone(), 'class': 'cdate', 'data-fk': 'd:' + c.id, 'aria-label': 'Date, time ' + n }),
+          function (e) { c.date = e.target.value; changed(); })),
+        sortOnBlur(onEdit(el('input', { type: 'time', value: c.time, 'class': 'ctime', 'data-fk': 't:' + c.id, 'aria-label': 'Time ' + n }),
+          function (e) { c.time = e.target.value; changed(); })),
+        el('div', { 'class': 'local' }),
+        el('div', { 'class': 'msg' }, ['Date and time required'])
+      ]));
+    });
+    grid.appendChild(el('thead', null, [hr]));
+
+    // Body: one row per medication, dose under each time
+    var tb = el('tbody');
+    state.meds.forEach(function (m, r) {
+      var nameIn = onEdit(el('input', { type: 'text', value: m.name, placeholder: 'Medication name',
+        autocomplete: 'off', 'aria-label': 'Medication ' + (r + 1) + ' name', 'class': 'medname', 'data-fk': 'n:' + m.id }),
+        function (e) { m.name = e.target.value; changed(); });
+      var cell = el('div', { 'class': 'medcell' }, [nameIn]);
+      if (!oneMed) cell.appendChild(removeBtn(function () {
+        state.meds.splice(state.meds.indexOf(m), 1); render(); changed();
+      }, 'Remove medication ' + (r + 1)));
+      var freqIn = onEdit(el('input', { type: 'text', value: m.freq || '', placeholder: 'Frequency', 'class': 'freq', 'data-fk': 'f:' + m.id,
+        autocomplete: 'off', 'aria-label': 'Medication ' + (r + 1) + ' frequency' }),
+        function (e) { m.freq = e.target.value; changed(); });
+      var prnBox = el('input', { type: 'checkbox', 'aria-label': 'Medication ' + (r + 1) + ' given as needed (PRN)' });
+      prnBox.checked = !!m.prn;
+      prnBox.addEventListener('change', function () { m.prn = prnBox.checked; changed(); });
+      var sub = el('div', { 'class': 'medsub' }, [freqIn, el('label', { 'class': 'prn' }, [prnBox, 'PRN'])]);
+      var tr = el('tr', null, [el('th', { 'class': 'rowh', scope: 'row', 'data-med': m.id }, [
+        cell, sub, el('div', { 'class': 'msg' }, ['Medication name required'])
+      ])]);
+      state.cols.forEach(function (c, i) {
+        if (!m.routes) m.routes = {};
+        var rsel = el('select', { 'class': 'tzsel route', 'data-med': m.id, 'data-col': c.id, 'data-fk': 'r:' + m.id + ':' + c.id,
+          'aria-label': 'Route for medication ' + (r + 1) + ' at time ' + (i + 1) });
+        rsel.appendChild(el('option', { value: '' }, ['Route…']));
+        ROUTES.forEach(function (rt) {
+          var o = el('option', { value: rt }, [rt]);
+          if (m.routes[c.id] === rt) o.selected = true;
+          rsel.appendChild(o);
+        });
+        rsel.addEventListener('change', function () { m.routes[c.id] = rsel.value; changed(); });
+        if (!m.units) m.units = {};
+        var usel = el('select', { 'class': 'tzsel unit', 'data-med': m.id, 'data-col': c.id, 'data-fk': 'u:' + m.id + ':' + c.id,
+          'aria-label': 'Units for medication ' + (r + 1) + ' at time ' + (i + 1) });
+        usel.appendChild(el('option', { value: '' }, ['Unit']));
+        UNITS.forEach(function (u) {
+          var o = el('option', { value: u }, [u]);
+          if (m.units[c.id] === u) o.selected = true;
+          usel.appendChild(o);
+        });
+        usel.addEventListener('change', function () { m.units[c.id] = usel.value; changed(); });
+        var doseIn = onEdit(el('input', { type: 'text', inputmode: 'decimal', value: m.doses[c.id] || '', placeholder: 'Dose',
+          autocomplete: 'off', 'class': 'dosenum', 'data-med': m.id, 'data-col': c.id, 'data-fk': 'x:' + m.id + ':' + c.id,
+          'aria-label': 'Dose amount of medication ' + (r + 1) + ' at time ' + (i + 1) }),
+          function (e) { m.doses[c.id] = e.target.value; changed(); });
+        tr.appendChild(el('td', { 'class': 'col', 'data-col': c.id }, [
+          el('div', { 'class': 'doserow' }, [doseIn, usel]),
+          el('span', { 'class': 'dosemsg', 'data-med': m.id, 'data-col': c.id }),
+          rsel, el('span', { 'class': 'selmsg' }, ['Route required'])
+        ]));
+      });
+      tb.appendChild(tr);
+    });
+    grid.appendChild(tb);
+
+    // Footer: initials per column
+    var fr = el('tr', null, [el('th', { 'class': 'rowh', scope: 'row' }, ['Initials'])]);
+    state.cols.forEach(function (c, i) {
+      fr.appendChild(el('td', { 'class': 'col initials', 'data-col': c.id }, [
+        onEdit(el('input', { type: 'text', value: c.initials, maxlength: '4', autocomplete: 'off', 'data-fk': 'i:' + c.id,
+          autocapitalize: 'characters', spellcheck: 'false', 'aria-label': 'Initials, time ' + (i + 1) }),
+          function (e) { c.initials = e.target.value.toUpperCase(); changed(); }),
+        el('div', { 'class': 'msg' }, ['Initials required'])
+      ]));
+    });
+    grid.appendChild(el('tfoot', null, [fr]));
+
+    validate();
+    updateClock();
+    resize();
+    if (fk) { var back = grid.querySelector('[data-fk="' + fk + '"]'); if (back) try { back.focus({ preventScroll: true }); } catch (e) { back.focus(); } }
+  }
+
+  // Live reference: current UTC time next to the phone's own time, so crews can see the conversion.
+  function offsetLabel(mins) {
+    if (!mins) return 'UTC';
+    var a = Math.abs(mins), h = Math.floor(a / 60), m = a % 60;
+    return 'UTC' + (mins < 0 ? '−' : '+') + h + (m ? ':' + pad(m) : '');
+  }
+  // Time zone picker. Changing it converts times already entered, so each still marks the same moment.
+  function zoneSelect() {
+    var sel = el('select', { 'class': 'tzsel tz-record', 'aria-label': 'Time zone for this record' });
+    var pick = el('option', { value: '' }, ['Select time zone…']);
+    if (!zoneSet) pick.selected = true;
+    sel.appendChild(pick);
+    for (var mins = -720; mins <= 840; mins += 30) {
+      var o = el('option', { value: String(mins) }, [offsetLabel(mins)]);
+      if (zoneSet && mins === zoneMins) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.addEventListener('change', function () {
+      if (sel.value === '') return;
+      var next = parseInt(sel.value, 10), delta = next - zoneMins;
+      state.cols.forEach(function (c) { shiftCol(c, delta); });
+      zoneMins = next; zoneSet = true;
+      render(); changed();
+    });
+    return el('span', null, [sel, el('span', { 'class': 'selmsg' }, ['Time zone required'])]);
+  }
+  function rcvSelect() {
+    var sel = el('select', { 'class': 'tzsel tz-rcv', 'aria-label': 'Receiving facility time zone' });
+    var none = el('option', { value: 'none' }, ['Select time zone…']);
+    if (rcvMins === null) none.selected = true;
+    sel.appendChild(none);
+    for (var mins = -720; mins <= 840; mins += 30) {
+      var o = el('option', { value: String(mins) }, [offsetLabel(mins)]);
+      if (mins === rcvMins) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.addEventListener('change', function () {
+      rcvMins = sel.value === 'none' ? null : parseInt(sel.value, 10);
+      render(); changed();
+    });
+    return el('span', null, [sel, el('span', { 'class': 'selmsg' }, ['Time zone required'])]);
+  }
+  function shiftCol(c, delta) {
+    var tm = /^(\d{2}):(\d{2})/.exec(c.time || '');
+    if (!tm || !delta) return;
+    var dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(c.date || '');
+    var base = dm ? Date.UTC(+dm[1], +dm[2] - 1, +dm[3], +tm[1], +tm[2]) : Date.UTC(2000, 0, 1, +tm[1], +tm[2]);
+    var d = new Date(base + delta * 60000);
+    if (dm) c.date = d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+    c.time = pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes());
+  }
+  function updateClock() {
+    var box = grid.querySelector('.clock');
+    if (!box) return;
+    var d = new Date(), z = new Date(d.getTime() + zoneMins * 60000);
+    box.textContent = 'Now ' + pad(z.getUTCHours()) + ':' + pad(z.getUTCMinutes()) + ' ' + zoneName();
+    box.appendChild(el('span', null, ['Phone ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) +
+      ' (' + offsetLabel(-d.getTimezoneOffset()) + ')']));
+  }
+  setInterval(updateClock, 15000);
+
+  // A column with any dose must have a date, a time and initials.
+  function validate() {
+    var noInit = 0, noDT = 0, future = 0;
+    state.cols.forEach(function (c) {
+      var has = state.meds.some(function (m) { return filled(m.doses[c.id]); });
+      var dateMiss = has && !filled(c.date), timeMiss = has && !filled(c.time);
+      var initMiss = has && !filled(c.initials);
+      var fut = isFuture(c);
+      if (initMiss) noInit++;
+      if (dateMiss || timeMiss) noDT++;
+      if (fut) future++;
+      var routeMiss = state.meds.some(function (m) { return filled(m.doses[c.id]) && (!filled((m.routes || {})[c.id]) || !filled((m.units || {})[c.id]) || !isNumber(m.doses[c.id])); });
+      var signed = has && !initMiss && !dateMiss && !timeMiss && !fut && !routeMiss;
+
+      var cells = grid.querySelectorAll('[data-col="' + c.id + '"]');
+      for (var i = 0; i < cells.length; i++) {
+        cells[i].classList.toggle('signed', signed);
+        if (cells[i].classList.contains('initials')) cells[i].classList.toggle('need', initMiss);
+      }
+      var th = grid.querySelector('thead th[data-col="' + c.id + '"]');
+      if (th) {
+        th.classList.toggle('need', dateMiss || timeMiss || fut);
+        th.querySelector('.cdate').classList.toggle('missing', dateMiss || fut);
+        th.querySelector('.ctime').classList.toggle('missing', timeMiss || (fut && filled(c.time)));
+        var hintEl = th.querySelector('.local');
+        hintEl.textContent = localHint(c);
+        var rt = receivingTime(c);
+        if (rt) hintEl.appendChild(el('span', { 'class': 'rcv' },
+          ['Receiving ' + rt.time + (rt.sameDay ? '' : ' (' + rt.dayLabel + ')')]));
+        th.querySelector('.msg').textContent = fut ? 'Can’t be in the future' :
+          dateMiss && timeMiss ? 'Date and time required' : dateMiss ? 'Date required' : 'Time required';
+      }
+    });
+    // A medication row with any dose must have a name.
+    var noName = 0;
+    state.meds.forEach(function (m) {
+      var has = state.cols.some(function (c) { return filled(m.doses[c.id]); });
+      var miss = has && !filled(m.name);
+      if (miss) noName++;
+      var th = grid.querySelector('tbody th[data-med="' + m.id + '"]');
+      if (th) { th.classList.toggle('need', miss); th.querySelector('.medname').classList.toggle('missing', miss); }
+    });
+
+    // Every dose needs a number, a unit and a route.
+    var noRoute = 0, noUnit = 0, notNum = 0;
+    state.meds.forEach(function (m) {
+      state.cols.forEach(function (c) {
+        var hasDose = filled(m.doses[c.id]);
+        var bad = hasDose && !isNumber(m.doses[c.id]);
+        var uMiss = hasDose && !filled((m.units || {})[c.id]);
+        if (bad) notNum++;
+        if (uMiss) noUnit++;
+        var sel = '[data-med="' + m.id + '"][data-col="' + c.id + '"]';
+        var di = grid.querySelector('input.dosenum' + sel), us = grid.querySelector('select.unit' + sel), dm = grid.querySelector('.dosemsg' + sel);
+        if (di) di.classList.toggle('missing', bad);
+        if (us) us.classList.toggle('missing', uMiss);
+        if (dm) { dm.textContent = bad && uMiss ? 'Numbers only; unit required' : bad ? 'Numbers only' : uMiss ? 'Unit required' : '';
+          dm.classList.toggle('show', bad || uMiss); }
+        var miss = hasDose && !filled((m.routes || {})[c.id]);
+        if (miss) noRoute++;
+        var rs = grid.querySelector('select.route[data-med="' + m.id + '"][data-col="' + c.id + '"]');
+        if (rs) rs.classList.toggle('missing', miss);
+      });
+    });
+
+    // Both time zones are always required, even if no doses are charted.
+    var zoneMiss = useUTC && !zoneSet, rcvMiss = useUTC && rcvMins === null;
+    var zs = grid.querySelector('.tz-record'), rs = grid.querySelector('.tz-rcv');
+    if (zs) zs.classList.toggle('missing', zoneMiss);
+    if (rs) rs.classList.toggle('missing', rcvMiss);
+
+    var parts = [];
+    if (zoneMiss) parts.push('Choose the time zone for this record.');
+    if (rcvMiss) parts.push('Choose the receiving facility time zone.');
+    if (noName) parts.push(noName === 1 ? '1 dose row has no medication name.' : noName + ' dose rows have no medication name.');
+    if (notNum) parts.push(notNum === 1 ? '1 dose isn’t a number.' : notNum + ' doses aren’t numbers.');
+    if (noUnit) parts.push(noUnit === 1 ? '1 dose has no unit.' : noUnit + ' doses have no unit.');
+    if (noRoute) parts.push(noRoute === 1 ? '1 dose has no route.' : noRoute + ' doses have no route.');
+    if (future) parts.push(future === 1 ? '1 time is in the future.' : future + ' times are in the future.');
+    if (noDT) parts.push(noDT === 1 ? '1 time with doses is missing its date or time.' : noDT + ' times with doses are missing a date or time.');
+    if (noInit) parts.push(noInit === 1 ? '1 time with doses has no initials.' : noInit + ' times with doses have no initials.');
+    statusEl.textContent = parts.join(' ');
+    statusEl.className = 'status' + (parts.length ? ' bad' : '');
+    return parts.length === 0;
+  }
+
+  // Frequency and PRN shown after the name, e.g. "q4h PRN".
+  function medOrder(m) {
+    var f = (m.freq || '').trim();
+    return f + (m.prn ? (f ? ' ' : '') + 'PRN' : '');
+  }
+
+  // Plain-text value: readable in submissions and the PDF, and parsed back when a submission is edited.
+  function serialize() {
+    var lines = [];
+    var named = state.meds.filter(function (m) { return filled(m.name); })
+      .map(function (m) { var o = medOrder(m); return m.name.trim() + (o ? ' — ' + o : ''); });
+    if (named.length) lines.push('Medications: ' + named.join(' ; '));
+    orderedCols().forEach(function (c) {
+      var given = state.meds.filter(function (m) { return filled(m.doses[c.id]); });
+      if (!given.length && !filled(c.initials)) return;
+      var rt = receivingTime(c);
+      lines.push((c.date || '(no-date)') + ' ' + (c.time ? c.time + (useUTC && !zoneMins ? 'Z' : '') : '(no-time)') + ' | Initials: ' + (filled(c.initials) ? c.initials.trim() : '—') +
+        (rt ? ' | Receiving: ' + rt.date + ' ' + rt.time : ''));
+      given.forEach(function (m) {
+        var rt2 = (m.routes || {})[c.id];
+        var un = (m.units || {})[c.id];
+        lines.push('  - ' + (filled(m.name) ? m.name.trim() : '(unnamed)') + ': ' + m.doses[c.id].trim() + (un ? ' ' + un : '') + (rt2 ? ' (' + rt2 + ')' : ''));
+      });
+    });
+    if (useUTC && rcvMins !== null) lines.unshift('Receiving time zone: ' + offsetLabel(rcvMins));
+    if (useUTC && zoneSet) lines.unshift('Time zone: ' + zoneName());
+    return lines.length ? lines.join('\n') : '';
+  }
+
+  // ---------- Settings ----------
+  // output: "text" (default) or "image" (PDF-ready grid in blocks). perBlock: times per block (default 6).
+  var mode = 'text', perBlock = 6;
+  function readSettings() {
+    var o, p;
+    try { var q = new URLSearchParams(location.search); o = q.get('output'); p = q.get('perBlock'); } catch (e) {}
+    try {
+      if (window.JFCustomWidget && JFCustomWidget.getWidgetSetting) {
+        o = JFCustomWidget.getWidgetSetting('output') || o;
+        p = JFCustomWidget.getWidgetSetting('perBlock') || p;
+      }
+    } catch (e) {}
+    mode = String(o || 'text').toLowerCase() === 'image' ? 'image' : 'text';
+    var tz;
+    try { tz = new URLSearchParams(location.search).get('timezone'); } catch (e) {}
+    try { if (window.JFCustomWidget && JFCustomWidget.getWidgetSetting) tz = JFCustomWidget.getWidgetSetting('timezone') || tz; } catch (e) {}
+    useUTC = String(tz || 'utc').toLowerCase() !== 'local';
+    if (!zoneTouched) {
+      zoneMins = parseZone(tz);
+      zoneSet = !!(tz && String(tz).trim() && String(tz).toLowerCase() !== 'local');
+    }
+    var rz;
+    try { rz = new URLSearchParams(location.search).get('receivingTimezone'); } catch (e) {}
+    try { if (window.JFCustomWidget && JFCustomWidget.getWidgetSetting) rz = JFCustomWidget.getWidgetSetting('receivingTimezone') || rz; } catch (e) {}
+    if (!rcvTouched) rcvMins = (rz && String(rz).trim()) ? (/^\s*UTC\s*$/i.test(rz) ? 0 : parseZone(rz)) : null;
+    var n = parseInt(p, 10);
+    if (n >= 2 && n <= 12) perBlock = n;
+  }
+
+  // ---------- PDF layout: grid in blocks of `perBlock` times, stacked down a portrait page ----------
+  var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function fmtDate(d) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(d || '');
+    return m ? (+m[3]) + ' ' + MONTHS[+m[2] - 1] + ' ' + m[1] : (d || '');
+  }
+  function fit(ctx, text, w) {
+    text = text || '';
+    if (ctx.measureText(text).width <= w) return text;
+    while (text.length && ctx.measureText(text + '…').width > w) text = text.slice(0, -1);
+    return text + '…';
+  }
+  function drawBlocks() {
+    var cols = orderedCols().filter(function (c) {
+      return filled(c.initials) || state.meds.some(function (m) { return filled(m.doses[c.id]); });
+    });
+    var meds = state.meds.filter(function (m) {
+      return filled(m.name) || cols.some(function (c) { return filled(m.doses[c.id]); });
+    });
+    if (!cols.length && !meds.length) return '';
+    if (!meds.length) meds = [blankMed()];
+
+    var W = 760, MED = 170, CW = (W - MED) / perBlock, HEAD = useUTC ? 58 : 42, ROW = 36, RCV = (useUTC && rcvMins !== null) ? 54 : 0, GAP = 22, TITLE = 30, LABEL = 22, S = 2;
+    var F = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif';
+    var nBlocks = Math.max(1, Math.ceil(cols.length / perBlock));
+    var gridH = HEAD + ROW * meds.length + ROW + RCV;
+    var blockH = LABEL + gridH;
+    var H = TITLE + nBlocks * blockH + (nBlocks - 1) * GAP + 2;
+
+    var cv = document.createElement('canvas');
+    cv.width = W * S; cv.height = Math.ceil(H * S);
+    var x = cv.getContext('2d');
+    x.scale(S, S);
+    x.fillStyle = '#fff'; x.fillRect(0, 0, W, H);
+    x.textBaseline = 'middle';
+    x.fillStyle = '#000'; x.font = '600 16px ' + F;
+    x.fillText('Medication Administration Record' + (useUTC ? ' (times ' + zoneName() + ')' : ''), 0, TITLE / 2 - 2);
+    if (useUTC && rcvMins !== null) {
+      var tw = x.measureText('Medication Administration Record (times ' + zoneName() + ')').width;
+      x.font = '12px ' + F; x.fillStyle = '#1b5e7a';
+      x.fillText('Bottom row: receiving facility time (' + offsetLabel(rcvMins) + ')', Math.min(tw + 14, W - 270), TITLE / 2 - 1);
+      x.fillStyle = '#000';
+    }
+
+    for (var b = 0; b < nBlocks; b++) {
+      var y0 = TITLE + b * (blockH + GAP), top = y0 + LABEL;
+      var slice = cols.slice(b * perBlock, (b + 1) * perBlock);
+      var first = b * perBlock + 1, last = first + Math.max(slice.length, 1) - 1;
+
+      x.font = '12px ' + F; x.fillStyle = '#444';
+      x.fillText(first === last ? 'Time ' + first : 'Times ' + first + '–' + last, 0, y0 + LABEL / 2);
+
+      x.fillStyle = '#e9eef2'; x.fillRect(0, top, W, HEAD);
+      x.fillStyle = '#f4f6f8'; x.fillRect(0, top + HEAD + ROW * meds.length, W, ROW);
+      x.fillStyle = '#000';
+
+      if (useUTC) {
+        // Note identifying the header row: times given in the sending time zone, with its UTC offset.
+        x.font = '600 13px ' + F; x.fillText('Medication', 6, top + 13);
+        x.font = '11px ' + F; x.fillStyle = '#444';
+        x.fillText('Time given in sending', 6, top + 31);
+        x.fillText('time zone: ' + zoneName(), 6, top + 45);
+        x.fillStyle = '#000';
+      } else { x.font = '600 13px ' + F; x.fillText('Medication', 6, top + HEAD / 2); }
+      slice.forEach(function (c, i) {
+        var cx = MED + i * CW + 5;
+        var dy = (HEAD - 42) / 2;
+        x.font = '12px ' + F; x.fillText(fit(x, fmtDate(c.date) || 'No date', CW - 10), cx, top + 13 + dy);
+        x.font = '600 13px ' + F; x.fillText(fit(x, c.time ? c.time + (useUTC && !zoneMins ? 'Z' : '') : 'No time', CW - 10), cx, top + 30 + dy);
+      });
+
+      meds.forEach(function (m, r) {
+        var ry = top + HEAD + r * ROW + ROW / 2;
+        x.font = '13px ' + F;
+        var order = medOrder(m);
+        if (order) {
+          x.fillText(fit(x, m.name || '', MED - 12), 6, ry - 7);
+          x.font = '11px ' + F; x.fillStyle = '#555';
+          x.fillText(fit(x, order, MED - 12), 6, ry + 9);
+          x.font = '13px ' + F; x.fillStyle = '#000';
+        } else x.fillText(fit(x, m.name || '', MED - 12), 6, ry);
+        slice.forEach(function (c, i) {
+          var v = (m.doses[c.id] || '').trim(), rt = (m.routes || {})[c.id], un = (m.units || {})[c.id];
+          if (v && un) v += ' ' + un;
+          if (!v) return;
+          if (rt) {
+            x.fillText(fit(x, v, CW - 10), MED + i * CW + 5, ry - 7);
+            x.font = '11px ' + F; x.fillStyle = '#555';
+            x.fillText(fit(x, rt, CW - 10), MED + i * CW + 5, ry + 9);
+            x.font = '13px ' + F; x.fillStyle = '#000';
+          } else x.fillText(fit(x, v, CW - 10), MED + i * CW + 5, ry);
+        });
+      });
+
+      var iy = top + HEAD + meds.length * ROW + ROW / 2;
+      x.font = '600 13px ' + F; x.fillText('Initials', 6, iy);
+      x.textAlign = 'center';
+      slice.forEach(function (c, i) { if (filled(c.initials)) x.fillText(c.initials.trim(), MED + i * CW + CW / 2, iy); });
+      x.textAlign = 'left';
+
+      // Receiving facility row: same moment shown in the receiving time zone
+      if (RCV) {
+        var rTop = top + HEAD + meds.length * ROW + ROW;
+        x.fillStyle = '#eef5f8'; x.fillRect(0, rTop, W, RCV);
+        x.fillStyle = '#1b5e7a';
+        x.font = '600 12px ' + F;
+        x.fillText('Receiving Facility', 6, rTop + 12);
+        x.fillText('Date and Time', 6, rTop + 27);
+        x.font = '11px ' + F; x.fillText(offsetLabel(rcvMins), 6, rTop + 42);
+        slice.forEach(function (c, i) {
+          var rt = receivingTime(c), cx = MED + i * CW + 5;
+          if (!rt) return;
+          x.font = '12px ' + F; x.fillText(fit(x, fmtDate(rt.date), CW - 10), cx, rTop + 18);
+          x.font = '600 13px ' + F; x.fillText(fit(x, rt.time, CW - 10), cx, rTop + 36);
+        });
+        x.fillStyle = '#000';
+      }
+
+      x.strokeStyle = '#7a8792'; x.lineWidth = 1;
+      x.strokeRect(0.5, top + 0.5, W - 1, gridH);
+      x.beginPath();
+      for (var k = 0; k < perBlock; k++) {
+        var lx = Math.round(MED + k * CW) + 0.5;
+        x.moveTo(lx, top); x.lineTo(lx, top + gridH);
+      }
+      for (var r = 0; r <= meds.length + (RCV ? 1 : 0); r++) {
+        var ly = Math.round(top + HEAD + r * ROW) + 0.5;
+        x.moveTo(0, ly); x.lineTo(W, ly);
+      }
+      x.stroke();
+    }
+    // The record's text is tucked inside the PNG so drafts and edited submissions can reload the grid.
+    return embedData(cv.toDataURL('image/png'), serialize());
+  }
+
+  // ---------- Record data stored inside the PNG (tEXt chunk "mar-data") ----------
+  var CRC_T = (function () {
+    var t = [];
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  function crc32(b) {
+    var c = 0xFFFFFFFF;
+    for (var i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  function b64ToBytes(b64) {
+    var s = atob(b64), a = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+    return a;
+  }
+  function bytesToB64(a) {
+    var s = '';
+    for (var i = 0; i < a.length; i += 0x8000) s += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+  var DATA_KEY = 'mar-data';
+  function embedData(dataUrl, text) {
+    try {
+      var png = b64ToBytes(dataUrl.split(',')[1]);
+      var val = bytesToB64(new TextEncoder().encode(text || ''));
+      var typed = new Uint8Array(4 + DATA_KEY.length + 1 + val.length), i, o = 0;
+      [116, 69, 88, 116].forEach(function (v) { typed[o++] = v; });           // "tEXt"
+      for (i = 0; i < DATA_KEY.length; i++) typed[o++] = DATA_KEY.charCodeAt(i);
+      typed[o++] = 0;
+      for (i = 0; i < val.length; i++) typed[o++] = val.charCodeAt(i);
+      var len = typed.length - 4;
+      var chunk = new Uint8Array(12 + len), dv = new DataView(chunk.buffer);
+      dv.setUint32(0, len);
+      chunk.set(typed, 4);
+      dv.setUint32(8 + len, crc32(typed));
+      var at = 33; // right after the PNG signature and IHDR chunk
+      var out = new Uint8Array(png.length + chunk.length);
+      out.set(png.subarray(0, at)); out.set(chunk, at); out.set(png.subarray(at), at + chunk.length);
+      return 'data:image/png;base64,' + bytesToB64(out);
+    } catch (e) { return dataUrl; }
+  }
+  function extractData(bytes) {
+    var dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength), p = 8;
+    while (p + 8 <= bytes.length) {
+      var len = dv.getUint32(p);
+      var type = String.fromCharCode(bytes[p + 4], bytes[p + 5], bytes[p + 6], bytes[p + 7]);
+      if (type === 'tEXt') {
+        var d = bytes.subarray(p + 8, p + 8 + len), z = d.indexOf(0);
+        if (z > 0 && String.fromCharCode.apply(null, d.subarray(0, z)) === DATA_KEY) {
+          return new TextDecoder().decode(b64ToBytes(String.fromCharCode.apply(null, d.subarray(z + 1))));
+        }
+      }
+      if (type === 'IEND') break;
+      p += 12 + len;
+    }
+    return null;
+  }
+  // Reload a saved value: plain text, an image data URL, or an image link Jotform made from it.
+  function restore(v) {
+    if (!v || typeof v !== 'string') return Promise.resolve(false);
+    if (/^data:image\/png/i.test(v)) {
+      try { var t = extractData(b64ToBytes(v.split(',')[1])); return Promise.resolve(t ? parse(t) : false); }
+      catch (e) { return Promise.resolve(false); }
+    }
+    if (/^https?:/i.test(v)) {
+      return fetch(v).then(function (r) { return r.arrayBuffer(); })
+        .then(function (buf) { var t = extractData(new Uint8Array(buf)); return t ? parse(t) : false; })
+        .catch(function () { return false; });
+    }
+    return Promise.resolve(parse(v));
+  }
+
+  function outputValue() { return mode === 'image' ? drawBlocks() : serialize(); }
+
+  // ---------- Preview ----------
+  var previewEl = document.getElementById('preview');
+  var previewBtn = document.getElementById('togglePreview');
+  function refreshPreview() {
+    if (!previewEl.classList.contains('show')) return;
+    var url = drawBlocks();
+    if (url) previewEl.src = url; else previewEl.removeAttribute('src');
+    previewEl.style.display = url ? '' : 'none'; // nothing to show until something is charted
+    previewEl.alt = url ? 'Preview of the medication record as it will appear in the PDF' : 'Nothing entered yet';
+  }
+  previewEl.addEventListener('load', function () { resize(); });
+  previewBtn.addEventListener('click', function () {
+    var show = !previewEl.classList.contains('show');
+    previewEl.classList.toggle('show', show);
+    previewBtn.textContent = show ? 'Hide preview' : 'Preview PDF layout';
+    previewBtn.setAttribute('aria-expanded', show ? 'true' : 'false');
+    refreshPreview(); resize();
+  });
+
+  function parse(text) {
+    if (!text || typeof text !== 'string') return false;
+    var cols = [], meds = [], byName = {}, cur = null;
+    function med(name) {
+      var k = name.toLowerCase();
+      if (!byName[k]) { byName[k] = { id: nid(), name: name, freq: '', prn: false, doses: {}, units: {}, routes: {} }; meds.push(byName[k]); }
+      return byName[k];
+    }
+    text.split(/\r?\n/).forEach(function (l) {
+      var m;
+      if ((m = l.match(/^Receiving time zone: (.*)$/))) {
+        rcvMins = /^UTC$/i.test(m[1].trim()) ? 0 : parseZone(m[1]); rcvTouched = true;
+      } else if ((m = l.match(/^Time zone: (.*)$/))) {
+        zoneMins = /^UTC$/i.test(m[1].trim()) ? 0 : parseZone(m[1]); zoneTouched = true; zoneSet = true;
+      } else if ((m = l.match(/^Medications: (.*)$/))) {
+        m[1].split(' ; ').forEach(function (n) {
+          n = n.trim(); if (!n) return;
+          var k = n.lastIndexOf(' — '), order = '';
+          if (k > 0) { order = n.slice(k + 3).trim(); n = n.slice(0, k).trim(); }
+          var md = med(n);
+          if (/(^|\s)PRN$/i.test(order)) { md.prn = true; order = order.replace(/(^|\s)PRN$/i, '').trim(); }
+          md.freq = order;
+        });
+      } else if ((m = l.match(/^(\S+) (\S+) \| Initials: (.*)$/))) {
+        cur = { id: nid(), date: m[1] === '(no-date)' ? '' : m[1], time: m[2] === '(no-time)' ? '' : m[2].replace(/Z$/i, ''),
+          initials: m[3].split(' | ')[0].trim() === '—' ? '' : m[3].split(' | ')[0].trim() };
+        cols.push(cur);
+      } else if (cur && (m = l.match(/^\s+- (.*)$/))) {
+        var s = m[1], k = s.indexOf(': ');
+        if (k < 0) return;
+        var n = s.slice(0, k).trim(), d = s.slice(k + 2).trim();
+        var target = (n && n !== '(unnamed)') ? med(n) : (function () { var x = blankMed(); meds.push(x); return x; })();
+        var rm = /^(.*) \(([^()]+)\)$/.exec(d);
+        if (rm && ROUTES.indexOf(rm[2]) >= 0) { d = rm[1].trim(); target.routes[cur.id] = rm[2]; }
+        var um = /^(.*\S)\s+(\S+)$/.exec(d);
+        if (um && UNITS.indexOf(um[2]) >= 0) { d = um[1].trim(); if (!target.units) target.units = {}; target.units[cur.id] = um[2]; }
+        target.doses[cur.id] = d;
+      }
+    });
+    if (!cols.length && !meds.length) return false;
+    if (!cols.length) cols.push(blankCol());
+    if (!meds.length) meds.push(blankMed());
+    state.cols = cols; state.meds = meds;
+    return true;
+  }
+
+  function changed() {
+    validate();
+    clearTimeout(sendTimer);
+    sendTimer = setTimeout(function () {
+      if (window.JFCustomWidget) { try { JFCustomWidget.sendData({ value: outputValue() }); } catch (e) {} }
+      refreshPreview();
+    }, 300);
+    resize();
+  }
+
+  function resize() {
+    var h = Math.ceil(root.getBoundingClientRect().height) + 8;
+    if (h === lastH || !window.JFCustomWidget) return;
+    lastH = h;
+    try { JFCustomWidget.requestFrameResize({ height: h }); } catch (e) {}
+  }
+
+  document.getElementById('addMed').addEventListener('click', function () {
+    state.meds.push(blankMed()); render(); changed();
+    var names = grid.querySelectorAll('.medname');
+    if (names.length) names[names.length - 1].focus();
+  });
+  document.getElementById('sortTimes').addEventListener('click', function () {
+    var moved = sortScreen(); render(); changed();
+    statusEl.textContent = statusEl.textContent || (moved ? 'Times sorted.' : 'Times are already in order.');
+  });
+  document.getElementById('addTime').addEventListener('click', function () {
+    var nc = blankCol(true);
+    state.cols.push(nc); sortScreen(); render(); changed();
+    var th = grid.querySelector('thead th[data-col="' + nc.id + '"]'), sc = grid.parentNode;
+    if (th) sc.scrollLeft = Math.max(0, th.offsetLeft - 175);
+  });
+
+  // Starting layout
+  readSettings();
+  state.cols = [blankCol(), blankCol(), blankCol(), blankCol()];
+  state.meds = [blankMed(), blankMed(), blankMed()];
+  render();
+  refreshPreview();
+  if (window.ResizeObserver) new ResizeObserver(resize).observe(root);
+
+  // Jotform hookup (runs once the widget library has loaded; page also works standalone for testing)
+  window.MAR_BOOT = function () {
+    if (booted || !window.JFCustomWidget) return;
+    booted = true;
+    JFCustomWidget.subscribe('ready', function (data) {
+      readSettings();
+      var v = data && data.value;
+      render();
+      restore(v).then(function (ok) {
+        render();
+        refreshPreview();
+        if (!ok && v && /^(data:image|https?:)/i.test(v)) {
+          statusEl.textContent = 'The saved record could not be reloaded here. The submitted copy is unchanged.';
+          statusEl.className = 'status bad';
+        }
+        lastH = 0; resize();
+      });
+    });
+    JFCustomWidget.subscribe('submit', function () {
+      var ok = validate();
+      JFCustomWidget.sendSubmit({ valid: ok, value: ok ? outputValue() : serialize() });
+    });
+  };
+
+  // Offline cache
+  if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    try { navigator.serviceWorker.register('sw.js'); } catch (e) {}
+  }
+})();
+</script>
+
+<!-- Load the Jotform widget library: local copy first (works offline), Jotform's CDN as fallback -->
+<script>
+(function () {
+  function boot() { if (window.MAR_BOOT) window.MAR_BOOT(); }
+  var s = document.createElement('script');
+  s.src = 'JotFormCustomWidget.min.js';
+  s.onload = boot;
+  s.onerror = function () {
+    var c = document.createElement('script');
+    c.src = 'https://js.jotform.com/JotFormCustomWidget.min.js';
+    c.onload = boot; c.onerror = boot;
+    document.head.appendChild(c);
+  };
+  document.head.appendChild(s);
+})();
+</script>
+</body>
+</html>
